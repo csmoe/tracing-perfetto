@@ -1,6 +1,10 @@
 fn main() -> std::io::Result<()> {
     let protoc = prost_build::protoc_from_env();
-    if std::process::Command::new(protoc).arg("--version").output().is_err() {
+    if std::process::Command::new(protoc)
+        .arg("--version")
+        .output()
+        .is_err()
+    {
         #[allow(unused_unsafe)]
         unsafe {
             std::env::set_var("PROTOC", protobuf_src::protoc());
