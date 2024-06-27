@@ -1,7 +1,6 @@
 #![forbid(unsafe_code)]
 
 use bytes::{BufMut, Bytes, BytesMut};
-use tracing_subscriber::fmt::MakeWriter;
 use core::fmt;
 use prost::Message;
 use std::io::Write;
@@ -16,6 +15,7 @@ use tracing::Event;
 use tracing::Id;
 use tracing::Metadata;
 use tracing::Subscriber;
+use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::Layer;
@@ -31,7 +31,7 @@ thread_local! {
 
 pub struct Config {}
 
-pub struct PerfettoSubscriber<W> {
+pub struct PerfettoSubscriber<W = fn() -> std::io::Stdout> {
     sequence_id: SequenceId,
     track_uuid: TrackUuid,
     writer: W,
@@ -40,8 +40,8 @@ pub struct PerfettoSubscriber<W> {
 impl<W: for<'writer> MakeWriter<'writer> + 'static> PerfettoSubscriber<W> {
     pub fn new(writer: W) -> Self {
         Self {
-            sequence_id: SequenceId(NonZeroU64::new(0).unwrap()),
-            track_uuid: TrackUuid(NonZeroU64::new(0).unwrap()),
+            sequence_id: SequenceId(NonZeroU64::new(1).unwrap()),
+            track_uuid: TrackUuid(NonZeroU64::new(1).unwrap()),
             writer,
         }
     }
@@ -51,6 +51,7 @@ impl<W: for<'writer> MakeWriter<'writer> + 'static> PerfettoSubscriber<W> {
         let Ok(_) = log.encode(&mut buf) else {
             return;
         };
+        self.writer.make_writer().write_all(&buf).unwrap();
     }
 }
 
@@ -81,14 +82,15 @@ impl TrackUuid {
 impl<W, S: Subscriber> Layer<S> for PerfettoSubscriber<W>
 where
     S: for<'a> LookupSpan<'a>,
-    W: for<'writer> MakeWriter<'writer> + 'static
+    W: for<'writer> MakeWriter<'writer> + 'static,
 {
     fn on_new_span(&self, attrs: &span::Attributes<'_>, id: &span::Id, ctx: Context<'_, S>) {
         let Some(span) = ctx.span(id) else {
             return;
         };
         let thread_first_frame_sent = THREAD_FIRST_PACKET_SENT
-            .with(|v| v.fetch_and(false, std::sync::atomic::Ordering::SeqCst));
+            .with(|v| v.fetch_or(true, std::sync::atomic::Ordering::SeqCst));
+
         let mut trace = idl::Trace::default();
         if !thread_first_frame_sent {
             let mut packet = idl::TracePacket::default();
@@ -98,8 +100,8 @@ where
             let process = create_process_descriptor();
             let thread = create_thread_descriptor();
             let track_desc = create_track_descriptor(
+                Some(id.into_u64()),
                 Some(self.track_uuid.get()),
-                span.parent().map(|s|s.id().into_u64()),
                 None::<&str>,
                 Some(process),
                 Some(thread),
@@ -111,7 +113,7 @@ where
 
         let mut packet = idl::TracePacket::default();
         let event = create_event(
-            self.track_uuid.get(),
+            id.into_u64(),
             Some(span.metadata().name()),
             span.metadata().file().zip(span.metadata().line()),
             Some(idl::track_event::Type::SliceBegin),
@@ -141,6 +143,7 @@ where
         let mut packet = idl::TracePacket::default();
         packet.data = Some(idl::trace_packet::Data::TrackEvent(event));
         packet.trusted_pid = Some(std::process::id() as _);
+        packet.timestamp = chrono::Local::now().timestamp_nanos_opt().map(|t| t as _);
         packet.optional_trusted_packet_sequence_id = Some(
             idl::trace_packet::OptionalTrustedPacketSequenceId::TrustedPacketSequenceId(
                 self.sequence_id.get() as _,
@@ -156,12 +159,13 @@ where
         let Some(span) = ctx.span(&id) else {
             return;
         };
+
         let mut packet = idl::TracePacket::default();
-        let mut event = create_event(
-            self.track_uuid.get(),
+        let event = create_event(
+            id.into_u64(),
             Some(span.metadata().name()),
             span.metadata().file().zip(span.metadata().line()),
-            Some(idl::track_event::Type::SliceBegin),
+            Some(idl::track_event::Type::SliceEnd),
         );
         packet.data = Some(idl::trace_packet::Data::TrackEvent(event));
         packet.timestamp = chrono::Local::now().timestamp_nanos_opt().map(|t| t as _);
