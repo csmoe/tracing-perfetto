@@ -90,7 +90,6 @@ where
         let Some(span) = ctx.span(id) else {
             return;
         };
-
         let mut packets: Vec<idl::TracePacket> = Vec::with_capacity(2);
         let process_first_frame_sent = PROCESS_DESCRIPTOR_SENT.fetch_or(true, Ordering::SeqCst);
         if !process_first_frame_sent {
@@ -133,10 +132,12 @@ where
         }
 
         let mut packet = idl::TracePacket::default();
+
         let event = create_event(
             thread_track_uuid,
             Some(span.name()),
             span.metadata().file().zip(span.metadata().line()),
+            DebugAnnotations::default(),
             Some(idl::track_event::Type::SliceBegin),
         );
         packet.data = Some(idl::trace_packet::Data::TrackEvent(event));
@@ -154,11 +155,14 @@ where
     fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
         let metadata = event.metadata();
         let location = metadata.file().zip(metadata.line());
+        let mut debug_annotations = DebugAnnotations::default();
+        event.record(&mut debug_annotations);
         let event = THREAD_TRACK_UUID.with(|id| {
             create_event(
                 id.load(Ordering::Relaxed),
                 Some(metadata.name()),
                 location,
+                debug_annotations,
                 Some(idl::track_event::Type::Instant),
             )
         });
@@ -185,12 +189,26 @@ where
             return;
         };
 
+        let mut debug_annotations = DebugAnnotations::default();
+        debug_annotations.annotations.push({
+            let mut annotation = idl::DebugAnnotation::default();
+            annotation.name_field = Some(idl::debug_annotation::NameField::Name(
+                "metadata".to_string(),
+            ));
+            annotation.value = Some(idl::debug_annotation::Value::StringValue(format!(
+                "{:?}",
+                span.metadata()
+            )));
+            annotation
+        });
+
         let mut packet = idl::TracePacket::default();
         let event = THREAD_TRACK_UUID.with(|id| {
             create_event(
                 id.load(Ordering::Relaxed),
                 Some(span.metadata().name()),
                 span.metadata().file().zip(span.metadata().line()),
+                debug_annotations,
                 Some(idl::track_event::Type::SliceEnd),
             )
         });
@@ -247,6 +265,7 @@ fn create_event(
     track_uuid: u64,
     name: Option<&str>,
     location: Option<(&str, u32)>,
+    debug_annotations: DebugAnnotations,
     r#type: Option<idl::track_event::Type>,
 ) -> idl::TrackEvent {
     let mut event = idl::TrackEvent::default();
@@ -257,6 +276,9 @@ fn create_event(
     if let Some(t) = r#type {
         event.set_type(t);
     }
+    if !debug_annotations.annotations.is_empty() {
+        event.debug_annotations = debug_annotations.annotations;
+    }
     if let Some((file, line)) = location {
         let mut source_location = idl::SourceLocation::default();
         source_location.file_name = Some(file.to_owned());
@@ -265,4 +287,96 @@ fn create_event(
         event.source_location_field = Some(location);
     }
     event
+}
+
+#[derive(Default)]
+struct DebugAnnotations {
+    annotations: Vec<idl::DebugAnnotation>,
+}
+
+impl Visit for DebugAnnotations {
+    fn record_bool(&mut self, field: &Field, value: bool) {
+        let mut annotation = idl::DebugAnnotation::default();
+        annotation.name_field = Some(idl::debug_annotation::NameField::Name(
+            field.name().to_string(),
+        ));
+        annotation.value = Some(idl::debug_annotation::Value::BoolValue(value));
+        self.annotations.push(annotation);
+    }
+
+    fn record_str(&mut self, field: &Field, value: &str) {
+        let mut annotation = idl::DebugAnnotation::default();
+        annotation.name_field = Some(idl::debug_annotation::NameField::Name(
+            field.name().to_string(),
+        ));
+        annotation.value = Some(idl::debug_annotation::Value::StringValue(value.to_string()));
+        self.annotations.push(annotation);
+    }
+
+    fn record_f64(&mut self, field: &Field, value: f64) {
+        let mut annotation = idl::DebugAnnotation::default();
+        annotation.name_field = Some(idl::debug_annotation::NameField::Name(
+            field.name().to_string(),
+        ));
+        annotation.value = Some(idl::debug_annotation::Value::DoubleValue(value));
+        self.annotations.push(annotation);
+    }
+
+    fn record_i64(&mut self, field: &Field, value: i64) {
+        let mut annotation = idl::DebugAnnotation::default();
+        annotation.name_field = Some(idl::debug_annotation::NameField::Name(
+            field.name().to_string(),
+        ));
+        annotation.value = Some(idl::debug_annotation::Value::IntValue(value));
+        self.annotations.push(annotation);
+    }
+
+    fn record_i128(&mut self, field: &Field, value: i128) {
+        let mut annotation = idl::DebugAnnotation::default();
+        annotation.name_field = Some(idl::debug_annotation::NameField::Name(
+            field.name().to_string(),
+        ));
+        annotation.value = Some(idl::debug_annotation::Value::StringValue(value.to_string()));
+        self.annotations.push(annotation);
+    }
+
+    fn record_u128(&mut self, field: &Field, value: u128) {
+        let mut annotation = idl::DebugAnnotation::default();
+        annotation.name_field = Some(idl::debug_annotation::NameField::Name(
+            field.name().to_string(),
+        ));
+        annotation.value = Some(idl::debug_annotation::Value::StringValue(value.to_string()));
+        self.annotations.push(annotation);
+    }
+
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        let mut annotation = idl::DebugAnnotation::default();
+        annotation.name_field = Some(idl::debug_annotation::NameField::Name(
+            field.name().to_string(),
+        ));
+        annotation.value = Some(idl::debug_annotation::Value::IntValue(value as _));
+        self.annotations.push(annotation);
+    }
+
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        let mut annotation = idl::DebugAnnotation::default();
+        annotation.name_field = Some(idl::debug_annotation::NameField::Name(
+            field.name().to_string(),
+        ));
+        annotation.value = Some(idl::debug_annotation::Value::StringValue(format!(
+            "{value:?}"
+        )));
+        self.annotations.push(annotation);
+    }
+
+    fn record_error(&mut self, field: &Field, value: &(dyn std::error::Error + 'static)) {
+        let mut annotation = idl::DebugAnnotation::default();
+        annotation.name_field = Some(idl::debug_annotation::NameField::Name(
+            field.name().to_string(),
+        ));
+        annotation.value = Some(idl::debug_annotation::Value::StringValue(format!(
+            "{value}"
+        )));
+        self.annotations.push(annotation);
+    }
 }

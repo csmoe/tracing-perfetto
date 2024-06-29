@@ -44,7 +44,8 @@ fn sync_fn() {
 
 #[tracing::instrument]
 fn sync_inner() {
-    info!("inner");
+    let x = 1;
+    info!(x, "inner");
 }
 
 #[tracing::instrument]
