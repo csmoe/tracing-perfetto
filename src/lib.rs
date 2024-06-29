@@ -123,7 +123,7 @@ where
             let track_desc = create_track_descriptor(
                 thread_track_uuid.into(),
                 self.track_uuid.get().into(),
-                None::<&str>,
+                std::thread::current().name(),
                 None,
                 thread,
                 None,
