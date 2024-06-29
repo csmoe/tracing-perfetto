@@ -1,31 +1,31 @@
 use tokio::runtime::Handle;
-use tracing_perfetto::*;
 use tracing::{info, span, Level};
+use tracing_perfetto::*;
 use tracing_subscriber::fmt::format::Format;
-use tracing_subscriber::{fmt, layer::SubscriberExt,  Registry};
+use tracing_subscriber::{fmt, layer::SubscriberExt, Registry};
 
 #[tokio::test]
 async fn write() -> anyhow::Result<()> {
-    let perfetto_layer = PerfettoSubscriber::new(std::fs::File::create("/tmp/trace_perf").unwrap());
+    let file = std::env::temp_dir().join("test.pftrace");
+    let perfetto_layer =
+        PerfettoSubscriber::new(std::sync::Mutex::new(std::fs::File::create(&file)?));
 
     let fmt_layer = fmt::layer()
         .with_writer(std::io::stdout)
         .event_format(Format::default().with_thread_ids(true))
         .with_span_events(fmt::format::FmtSpan::FULL);
 
-    let subscriber = Registry::default()
-        .with(fmt_layer)
-        .with(perfetto_layer);
+    let subscriber = Registry::default().with(fmt_layer).with(perfetto_layer);
 
-    tracing::subscriber::set_global_default(subscriber).expect("Failed to set subscriber");
+    tracing::subscriber::set_global_default(subscriber)?;
 
-    info!("start");
+    info!(?file, "start");
 
     let demo_span = span!(Level::TRACE, "demo_span");
     let _enter = demo_span.enter();
 
     info!("in span");
-    test_fn();
+    sync_fn();
     let handle = Handle::current();
     let t = std::thread::spawn(move || {
         handle.spawn(async_fn());
@@ -37,13 +37,13 @@ async fn write() -> anyhow::Result<()> {
 }
 
 #[tracing::instrument]
-fn test_fn() {
+fn sync_fn() {
     info!("inside function");
-    inner();
+    sync_inner();
 }
 
 #[tracing::instrument]
-fn inner() {
+fn sync_inner() {
     info!("inner");
 }
 

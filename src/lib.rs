@@ -5,7 +5,7 @@ use core::fmt;
 use prost::Message;
 use std::io::Write;
 use std::num::NonZeroU64;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tracing::field::Field;
 use tracing::field::Visit;
 use tracing::span;
@@ -25,9 +25,11 @@ mod idl {
 }
 
 thread_local! {
-    static THREAD_TRACK_UUID: AtomicU32 = AtomicU32::new(rand::random::<u32>());
-    static THREAD_FIRST_PACKET_SENT: AtomicBool = AtomicBool::new(false);
+    static THREAD_TRACK_UUID: AtomicU64 = AtomicU64::new(rand::random::<u64>());
+    static THREAD_DESCRIPTOR_SENT: AtomicBool = AtomicBool::new(false);
 }
+
+static PROCESS_DESCRIPTOR_SENT: AtomicBool = AtomicBool::new(false);
 
 pub struct Config {}
 
@@ -40,8 +42,8 @@ pub struct PerfettoSubscriber<W = fn() -> std::io::Stdout> {
 impl<W: for<'writer> MakeWriter<'writer> + 'static> PerfettoSubscriber<W> {
     pub fn new(writer: W) -> Self {
         Self {
-            sequence_id: SequenceId(NonZeroU64::new(1).unwrap()),
-            track_uuid: TrackUuid(NonZeroU64::new(1).unwrap()),
+            sequence_id: SequenceId::new(NonZeroU64::new(rand::random()).unwrap()),
+            track_uuid: TrackUuid::new(NonZeroU64::new(rand::random()).unwrap()),
             writer,
         }
     }
@@ -88,33 +90,52 @@ where
         let Some(span) = ctx.span(id) else {
             return;
         };
-        let thread_first_frame_sent = THREAD_FIRST_PACKET_SENT
-            .with(|v| v.fetch_or(true, std::sync::atomic::Ordering::SeqCst));
 
-        let mut trace = idl::Trace::default();
+        let mut packets: Vec<idl::TracePacket> = Vec::with_capacity(2);
+        let process_first_frame_sent = PROCESS_DESCRIPTOR_SENT.fetch_or(true, Ordering::SeqCst);
+        if !process_first_frame_sent {
+            let mut packet = idl::TracePacket::default();
+            packet.optional_trusted_uid = Some(idl::trace_packet::OptionalTrustedUid::TrustedUid(
+                self.sequence_id.get() as _,
+            ));
+            let process = create_process_descriptor().into();
+            let track_desc = create_track_descriptor(
+                self.track_uuid.get().into(),
+                None,
+                None::<&str>,
+                process,
+                None,
+                None,
+            );
+            packet.data = Some(idl::trace_packet::Data::TrackDescriptor(track_desc));
+            packets.push(packet);
+        }
+
+        let thread_first_frame_sent =
+            THREAD_DESCRIPTOR_SENT.with(|v| v.fetch_or(true, Ordering::SeqCst));
+        let thread_track_uuid = THREAD_TRACK_UUID.with(|id| id.load(Ordering::Relaxed));
         if !thread_first_frame_sent {
             let mut packet = idl::TracePacket::default();
             packet.optional_trusted_uid = Some(idl::trace_packet::OptionalTrustedUid::TrustedUid(
                 self.sequence_id.get() as _,
             ));
-            let process = create_process_descriptor();
-            let thread = create_thread_descriptor();
+            let thread = create_thread_descriptor().into();
             let track_desc = create_track_descriptor(
-                Some(id.into_u64()),
-                Some(self.track_uuid.get()),
+                thread_track_uuid.into(),
+                self.track_uuid.get().into(),
                 None::<&str>,
-                Some(process),
-                Some(thread),
+                None,
+                thread,
                 None,
             );
             packet.data = Some(idl::trace_packet::Data::TrackDescriptor(track_desc));
-            trace.packet.push(packet);
+            packets.push(packet);
         }
 
         let mut packet = idl::TracePacket::default();
         let event = create_event(
-            id.into_u64(),
-            Some(span.metadata().name()),
+            thread_track_uuid,
+            Some(span.name()),
             span.metadata().file().zip(span.metadata().line()),
             Some(idl::track_event::Type::SliceBegin),
         );
@@ -126,20 +147,21 @@ where
                 self.sequence_id.get() as _,
             ),
         );
-        trace.packet.push(packet);
-
-        self.write_log(trace);
+        packets.push(packet);
+        span.extensions_mut().insert(packets);
     }
 
     fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
         let metadata = event.metadata();
         let location = metadata.file().zip(metadata.line());
-        let event = create_event(
-            self.track_uuid.get(),
-            Some(metadata.name()),
-            location,
-            Some(idl::track_event::Type::Instant),
-        );
+        let event = THREAD_TRACK_UUID.with(|id| {
+            create_event(
+                id.load(Ordering::Relaxed),
+                Some(metadata.name()),
+                location,
+                Some(idl::track_event::Type::Instant),
+            )
+        });
         let mut packet = idl::TracePacket::default();
         packet.data = Some(idl::trace_packet::Data::TrackEvent(event));
         packet.trusted_pid = Some(std::process::id() as _);
@@ -159,14 +181,19 @@ where
         let Some(span) = ctx.span(&id) else {
             return;
         };
+        let Some(mut packets) = span.extensions_mut().remove::<Vec<idl::TracePacket>>() else {
+            return;
+        };
 
         let mut packet = idl::TracePacket::default();
-        let event = create_event(
-            id.into_u64(),
-            Some(span.metadata().name()),
-            span.metadata().file().zip(span.metadata().line()),
-            Some(idl::track_event::Type::SliceEnd),
-        );
+        let event = THREAD_TRACK_UUID.with(|id| {
+            create_event(
+                id.load(Ordering::Relaxed),
+                Some(span.metadata().name()),
+                span.metadata().file().zip(span.metadata().line()),
+                Some(idl::track_event::Type::SliceEnd),
+            )
+        });
         packet.data = Some(idl::trace_packet::Data::TrackEvent(event));
         packet.timestamp = chrono::Local::now().timestamp_nanos_opt().map(|t| t as _);
         packet.trusted_pid = Some(std::process::id() as _);
@@ -175,9 +202,8 @@ where
                 self.sequence_id.get() as _,
             ),
         );
-        let trace = idl::Trace {
-            packet: vec![packet],
-        };
+        packets.push(packet);
+        let trace = idl::Trace { packet: packets };
 
         self.write_log(trace);
     }
