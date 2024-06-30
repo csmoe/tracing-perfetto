@@ -29,14 +29,19 @@ thread_local! {
     static THREAD_DESCRIPTOR_SENT: AtomicBool = AtomicBool::new(false);
 }
 
+// This is thread safe, since duplicated descriptor will be combined into one by perfetto.
 static PROCESS_DESCRIPTOR_SENT: AtomicBool = AtomicBool::new(false);
-
-pub struct Config {}
 
 pub struct PerfettoSubscriber<W = fn() -> std::io::Stdout> {
     sequence_id: SequenceId,
     track_uuid: TrackUuid,
     writer: W,
+    config: Config,
+}
+
+#[derive(Default)]
+struct Config {
+    debug_annotations: bool,
 }
 
 impl<W: for<'writer> MakeWriter<'writer> + 'static> PerfettoSubscriber<W> {
@@ -45,11 +50,65 @@ impl<W: for<'writer> MakeWriter<'writer> + 'static> PerfettoSubscriber<W> {
             sequence_id: SequenceId::new(NonZeroU64::new(rand::random()).unwrap()),
             track_uuid: TrackUuid::new(NonZeroU64::new(rand::random()).unwrap()),
             writer,
+            config: Config::default(),
+        }
+    }
+
+    pub fn with_debug_annotations(&mut self, value: bool) {
+        self.config.debug_annotations = true;
+    }
+
+    fn append_thread_descriptor(&self, trace: &mut idl::Trace) {
+        let thread_first_frame_sent =
+            THREAD_DESCRIPTOR_SENT.with(|v| v.fetch_or(true, Ordering::SeqCst));
+        let thread_track_uuid = THREAD_TRACK_UUID.with(|id| id.load(Ordering::Relaxed));
+        if !thread_first_frame_sent {
+            let mut packet = idl::TracePacket::default();
+            packet.optional_trusted_uid = Some(idl::trace_packet::OptionalTrustedUid::TrustedUid(
+                self.sequence_id.get() as _,
+            ));
+            let thread = create_thread_descriptor().into();
+            let track_desc = create_track_descriptor(
+                thread_track_uuid.into(),
+                self.track_uuid.get().into(),
+                std::thread::current().name(),
+                None,
+                thread,
+                None,
+            );
+            packet.data = Some(idl::trace_packet::Data::TrackDescriptor(track_desc));
+            trace.packet.push(packet);
+        }
+    }
+
+    fn append_process_descriptor(&self, trace: &mut idl::Trace) {
+        let process_first_frame_sent = PROCESS_DESCRIPTOR_SENT.fetch_or(true, Ordering::SeqCst);
+        if !process_first_frame_sent {
+            let mut packet = idl::TracePacket::default();
+            packet.optional_trusted_uid = Some(idl::trace_packet::OptionalTrustedUid::TrustedUid(
+                self.sequence_id.get() as _,
+            ));
+            let process = create_process_descriptor().into();
+            let track_desc = create_track_descriptor(
+                self.track_uuid.get().into(),
+                None,
+                None::<&str>,
+                process,
+                None,
+                None,
+            );
+            packet.data = Some(idl::trace_packet::Data::TrackDescriptor(track_desc));
+            trace.packet.push(packet);
         }
     }
 
     fn write_log(&self, log: idl::Trace) {
         let mut buf = BytesMut::new();
+        let mut log = log;
+
+        self.append_process_descriptor(&mut log);
+        self.append_thread_descriptor(&mut log);
+
         let Ok(_) = log.encode(&mut buf) else {
             return;
         };
@@ -90,49 +149,9 @@ where
         let Some(span) = ctx.span(id) else {
             return;
         };
-        let mut packets: Vec<idl::TracePacket> = Vec::with_capacity(2);
-        let process_first_frame_sent = PROCESS_DESCRIPTOR_SENT.fetch_or(true, Ordering::SeqCst);
-        if !process_first_frame_sent {
-            let mut packet = idl::TracePacket::default();
-            packet.optional_trusted_uid = Some(idl::trace_packet::OptionalTrustedUid::TrustedUid(
-                self.sequence_id.get() as _,
-            ));
-            let process = create_process_descriptor().into();
-            let track_desc = create_track_descriptor(
-                self.track_uuid.get().into(),
-                None,
-                None::<&str>,
-                process,
-                None,
-                None,
-            );
-            packet.data = Some(idl::trace_packet::Data::TrackDescriptor(track_desc));
-            packets.push(packet);
-        }
-
-        let thread_first_frame_sent =
-            THREAD_DESCRIPTOR_SENT.with(|v| v.fetch_or(true, Ordering::SeqCst));
-        let thread_track_uuid = THREAD_TRACK_UUID.with(|id| id.load(Ordering::Relaxed));
-        if !thread_first_frame_sent {
-            let mut packet = idl::TracePacket::default();
-            packet.optional_trusted_uid = Some(idl::trace_packet::OptionalTrustedUid::TrustedUid(
-                self.sequence_id.get() as _,
-            ));
-            let thread = create_thread_descriptor().into();
-            let track_desc = create_track_descriptor(
-                thread_track_uuid.into(),
-                self.track_uuid.get().into(),
-                std::thread::current().name(),
-                None,
-                thread,
-                None,
-            );
-            packet.data = Some(idl::trace_packet::Data::TrackDescriptor(track_desc));
-            packets.push(packet);
-        }
 
         let mut packet = idl::TracePacket::default();
-
+        let thread_track_uuid = THREAD_TRACK_UUID.with(|id| id.load(Ordering::Relaxed));
         let event = create_event(
             thread_track_uuid,
             Some(span.name()),
@@ -148,16 +167,22 @@ where
                 self.sequence_id.get() as _,
             ),
         );
-        packets.push(packet);
-        span.extensions_mut().insert(packets);
+        span.extensions_mut().insert(idl::Trace {
+            packet: vec![packet],
+        });
     }
 
-    fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+    fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
         let metadata = event.metadata();
         let location = metadata.file().zip(metadata.line());
+
         let mut debug_annotations = DebugAnnotations::default();
-        event.record(&mut debug_annotations);
-        let event = THREAD_TRACK_UUID.with(|id| {
+
+        if self.config.debug_annotations {
+            event.record(&mut debug_annotations);
+        }
+
+        let track_event = THREAD_TRACK_UUID.with(|id| {
             create_event(
                 id.load(Ordering::Relaxed),
                 Some(metadata.name()),
@@ -167,7 +192,7 @@ where
             )
         });
         let mut packet = idl::TracePacket::default();
-        packet.data = Some(idl::trace_packet::Data::TrackEvent(event));
+        packet.data = Some(idl::trace_packet::Data::TrackEvent(track_event));
         packet.trusted_pid = Some(std::process::id() as _);
         packet.timestamp = chrono::Local::now().timestamp_nanos_opt().map(|t| t as _);
         packet.optional_trusted_packet_sequence_id = Some(
@@ -175,6 +200,13 @@ where
                 self.sequence_id.get() as _,
             ),
         );
+
+        if let Some(span) = ctx.event_span(event) {
+            if let Some(trace) = span.extensions_mut().get_mut::<idl::Trace>() {
+                trace.packet.push(packet);
+                return;
+            }
+        }
         let trace = idl::Trace {
             packet: vec![packet],
         };
@@ -185,22 +217,24 @@ where
         let Some(span) = ctx.span(&id) else {
             return;
         };
-        let Some(mut packets) = span.extensions_mut().remove::<Vec<idl::TracePacket>>() else {
+        let Some(mut trace) = span.extensions_mut().remove::<idl::Trace>() else {
             return;
         };
 
         let mut debug_annotations = DebugAnnotations::default();
-        debug_annotations.annotations.push({
-            let mut annotation = idl::DebugAnnotation::default();
-            annotation.name_field = Some(idl::debug_annotation::NameField::Name(
-                "metadata".to_string(),
-            ));
-            annotation.value = Some(idl::debug_annotation::Value::StringValue(format!(
-                "{:?}",
-                span.metadata()
-            )));
-            annotation
-        });
+        if self.config.debug_annotations {
+            debug_annotations.annotations.push({
+                let mut annotation = idl::DebugAnnotation::default();
+                annotation.name_field = Some(idl::debug_annotation::NameField::Name(
+                    "metadata".to_string(),
+                ));
+                annotation.value = Some(idl::debug_annotation::Value::StringValue(format!(
+                    "{:?}",
+                    span.metadata()
+                )));
+                annotation
+            });
+        }
 
         let mut packet = idl::TracePacket::default();
         let event = THREAD_TRACK_UUID.with(|id| {
@@ -220,8 +254,7 @@ where
                 self.sequence_id.get() as _,
             ),
         );
-        packets.push(packet);
-        let trace = idl::Trace { packet: packets };
+        trace.packet.push(packet);
 
         self.write_log(trace);
     }
