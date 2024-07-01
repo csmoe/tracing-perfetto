@@ -7,9 +7,8 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, Registry};
 #[tokio::test]
 async fn write() -> anyhow::Result<()> {
     let file = std::env::temp_dir().join("test.pftrace");
-    let perfetto_layer =
-        PerfettoLayer::new(std::sync::Mutex::new(std::fs::File::create(&file)?))
-            .with_filter_by_marker(|s| s == "perfetto");
+    let perfetto_layer = PerfettoLayer::new(std::sync::Mutex::new(std::fs::File::create(&file)?))
+        .with_filter_by_marker(|s| s == "perfetto");
 
     let fmt_layer = fmt::layer()
         .with_writer(std::io::stdout)

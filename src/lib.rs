@@ -1,5 +1,4 @@
 #![doc = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"))]
-
 #![forbid(unsafe_code)]
 
 use bytes::BytesMut;
@@ -47,7 +46,7 @@ pub trait PerfettoWriter {
     fn write_log(&self, buf: BytesMut) -> std::io::Result<()>;
 }
 
-impl<W: for<'writer> MakeWriter<'writer> + 'static > PerfettoWriter for W {
+impl<W: for<'writer> MakeWriter<'writer> + 'static> PerfettoWriter for W {
     fn write_log(&self, buf: BytesMut) -> std::io::Result<()> {
         self.make_writer().write_all(&buf)
     }
@@ -84,7 +83,8 @@ impl<W: PerfettoWriter> PerfettoLayer<W> {
     /// use tracing_perfetto::PerfettoLayer;
     /// use tracing_subscriber::{layer::SubscriberExt, Registry, prelude::*};
     ///
-    /// let layer = PerfettoLayer::new(std::fs::File::open("/tmp/test.pftrace").unwrap()).with_filter_by_marker(|field_name| field_name == "perfetto");
+    /// let layer = PerfettoLayer::new(std::fs::File::open("/tmp/test.pftrace").unwrap())
+    ///                 .with_filter_by_marker(|field_name| field_name == "perfetto");
     /// tracing_subscriber::registry().with(layer).init();
     ///
     /// // this event will be record, as it contains a `perfetto` field
