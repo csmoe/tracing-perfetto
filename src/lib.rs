@@ -1,9 +1,10 @@
+#![doc = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"))]
+
 #![forbid(unsafe_code)]
 
 use bytes::BytesMut;
 use prost::Message;
 use std::io::Write;
-use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tracing::field::Field;
 use tracing::field::Visit;
@@ -28,11 +29,28 @@ thread_local! {
 // This is thread safe, since duplicated descriptor will be combined into one by perfetto.
 static PROCESS_DESCRIPTOR_SENT: AtomicBool = AtomicBool::new(false);
 
-pub struct PerfettoSubscriber<W = fn() -> std::io::Stdout> {
+/// A `Layer` that records span as perfetto's
+/// `TYPE_SLICE_BEGIN`/`TYPE_SLICE_END`, and event as `TYPE_INSTANT`.
+///
+/// `PerfettoLayer` will output the records as encoded [protobuf messages](https://github.com/google/perfetto).
+pub struct PerfettoLayer<W = fn() -> std::io::Stdout> {
     sequence_id: SequenceId,
     track_uuid: TrackUuid,
     writer: W,
     config: Config,
+}
+
+/// Writes encoded records into provided instance.
+///
+/// This is implemented for types implements [`MakeWriter`].
+pub trait PerfettoWriter {
+    fn write_log(&self, buf: BytesMut) -> std::io::Result<()>;
+}
+
+impl<W: for<'writer> MakeWriter<'writer> + 'static > PerfettoWriter for W {
+    fn write_log(&self, buf: BytesMut) -> std::io::Result<()> {
+        self.make_writer().write_all(&buf)
+    }
 }
 
 #[derive(Default)]
@@ -41,21 +59,45 @@ struct Config {
     filter: Option<fn(&str) -> bool>,
 }
 
-impl<W: for<'writer> MakeWriter<'writer> + 'static> PerfettoSubscriber<W> {
+impl<W: PerfettoWriter> PerfettoLayer<W> {
     pub fn new(writer: W) -> Self {
         Self {
-            sequence_id: SequenceId::new(NonZeroU64::new(rand::random()).unwrap()),
-            track_uuid: TrackUuid::new(NonZeroU64::new(rand::random()).unwrap()),
+            sequence_id: SequenceId::new(rand::random()),
+            track_uuid: TrackUuid::new(rand::random()),
             writer,
             config: Config::default(),
         }
     }
 
+    /// Configures whether or not spans/events shoulde be recored with their metadata and fields.
     pub fn with_debug_annotations(mut self, value: bool) -> Self {
         self.config.debug_annotations = value;
         self
     }
 
+    /// Configures whether or not spans/events be recored based on the occurrence of a field name.
+    ///
+    /// Sometimes, not all the events/spans should be treated as perfetto trace, you can append a
+    /// field to indicate that this even/span should be captured into trace:
+    ///
+    /// ```rust
+    /// use tracing_perfetto::PerfettoLayer;
+    /// use tracing_subscriber::{layer::SubscriberExt, Registry, prelude::*};
+    ///
+    /// let layer = PerfettoLayer::new(std::fs::File::open("/tmp/test.pftrace").unwrap()).with_filter_by_marker(|field_name| field_name == "perfetto");
+    /// tracing_subscriber::registry().with(layer).init();
+    ///
+    /// // this event will be record, as it contains a `perfetto` field
+    /// tracing::info!(perfetto = true, my_bool = true);
+    ///
+    /// // this span will be record, as it contains a `perfetto` field
+    /// #[tracing::instrument(fields(perfetto = true))]
+    /// fn to_instr() {
+    ///
+    ///   // this event will be ignored
+    ///   tracing::info!(my_bool = true);
+    /// }
+    /// ```
     pub fn with_filter_by_marker(mut self, filter: fn(&str) -> bool) -> Self {
         self.config.filter = Some(filter);
         self
@@ -115,31 +157,31 @@ impl<W: for<'writer> MakeWriter<'writer> + 'static> PerfettoSubscriber<W> {
         let Ok(_) = log.encode(&mut buf) else {
             return;
         };
-        self.writer.make_writer().write_all(&buf).unwrap();
+        _ = self.writer.write_log(buf);
     }
 }
 
-struct SequenceId(NonZeroU64);
+struct SequenceId(u64);
 
 impl SequenceId {
-    fn new(n: NonZeroU64) -> Self {
+    fn new(n: u64) -> Self {
         Self(n)
     }
 
     fn get(&self) -> u64 {
-        self.0.get()
+        self.0
     }
 }
 
-struct TrackUuid(NonZeroU64);
+struct TrackUuid(u64);
 
 impl TrackUuid {
-    fn new(n: NonZeroU64) -> Self {
+    fn new(n: u64) -> Self {
         Self(n)
     }
 
     fn get(&self) -> u64 {
-        self.0.get()
+        self.0
     }
 }
 
@@ -165,7 +207,7 @@ impl Visit for PerfettoVisitor {
     }
 }
 
-impl<W, S: Subscriber> Layer<S> for PerfettoSubscriber<W>
+impl<W, S: Subscriber> Layer<S> for PerfettoLayer<W>
 where
     S: for<'a> LookupSpan<'a>,
     W: for<'writer> MakeWriter<'writer> + 'static,

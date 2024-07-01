@@ -1,6 +1,6 @@
 use tokio::runtime::Handle;
 use tracing::{info, span, Level};
-use tracing_perfetto::*;
+use tracing_perfetto::PerfettoLayer;
 use tracing_subscriber::fmt::format::Format;
 use tracing_subscriber::{fmt, layer::SubscriberExt, Registry};
 
@@ -8,7 +8,7 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, Registry};
 async fn write() -> anyhow::Result<()> {
     let file = std::env::temp_dir().join("test.pftrace");
     let perfetto_layer =
-        PerfettoSubscriber::new(std::sync::Mutex::new(std::fs::File::create(&file)?))
+        PerfettoLayer::new(std::sync::Mutex::new(std::fs::File::create(&file)?))
             .with_filter_by_marker(|s| s == "perfetto");
 
     let fmt_layer = fmt::layer()
