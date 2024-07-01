@@ -1,7 +1,6 @@
 #![forbid(unsafe_code)]
 
-use bytes::{BufMut, Bytes, BytesMut};
-use core::fmt;
+use bytes::BytesMut;
 use prost::Message;
 use std::io::Write;
 use std::num::NonZeroU64;
@@ -9,11 +8,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tracing::field::Field;
 use tracing::field::Visit;
 use tracing::span;
-use tracing::span::Attributes;
-use tracing::span::Record;
 use tracing::Event;
 use tracing::Id;
-use tracing::Metadata;
 use tracing::Subscriber;
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::Context;
@@ -42,6 +38,7 @@ pub struct PerfettoSubscriber<W = fn() -> std::io::Stdout> {
 #[derive(Default)]
 struct Config {
     debug_annotations: bool,
+    filter: Option<fn(&str) -> bool>,
 }
 
 impl<W: for<'writer> MakeWriter<'writer> + 'static> PerfettoSubscriber<W> {
@@ -54,8 +51,14 @@ impl<W: for<'writer> MakeWriter<'writer> + 'static> PerfettoSubscriber<W> {
         }
     }
 
-    pub fn with_debug_annotations(&mut self, value: bool) {
-        self.config.debug_annotations = true;
+    pub fn with_debug_annotations(mut self, value: bool) -> Self {
+        self.config.debug_annotations = value;
+        self
+    }
+
+    pub fn with_filter_by_marker(mut self, filter: fn(&str) -> bool) -> Self {
+        self.config.filter = Some(filter);
+        self
     }
 
     fn append_thread_descriptor(&self, trace: &mut idl::Trace) {
@@ -140,6 +143,28 @@ impl TrackUuid {
     }
 }
 
+struct PerfettoVisitor {
+    perfetto: bool,
+    filter: fn(&str) -> bool,
+}
+
+impl PerfettoVisitor {
+    fn new(filter: fn(&str) -> bool) -> PerfettoVisitor {
+        Self {
+            filter,
+            perfetto: false,
+        }
+    }
+}
+
+impl Visit for PerfettoVisitor {
+    fn record_debug(&mut self, field: &Field, _value: &dyn std::fmt::Debug) {
+        if (self.filter)(field.name()) {
+            self.perfetto = true;
+        }
+    }
+}
+
 impl<W, S: Subscriber> Layer<S> for PerfettoSubscriber<W>
 where
     S: for<'a> LookupSpan<'a>,
@@ -149,6 +174,20 @@ where
         let Some(span) = ctx.span(id) else {
             return;
         };
+
+        let enabled = self
+            .config
+            .filter
+            .map(|f| {
+                let mut visitor = PerfettoVisitor::new(f);
+                attrs.record(&mut visitor);
+                visitor.perfetto
+            })
+            .unwrap_or(true);
+
+        if !enabled {
+            return;
+        }
 
         let mut packet = idl::TracePacket::default();
         let thread_track_uuid = THREAD_TRACK_UUID.with(|id| id.load(Ordering::Relaxed));
@@ -173,6 +212,20 @@ where
     }
 
     fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
+        let enabled = self
+            .config
+            .filter
+            .map(|f| {
+                let mut visitor = PerfettoVisitor::new(f);
+                event.record(&mut visitor);
+                visitor.perfetto
+            })
+            .unwrap_or_default();
+
+        if !enabled {
+            return;
+        }
+
         let metadata = event.metadata();
         let location = metadata.file().zip(metadata.line());
 
@@ -217,6 +270,7 @@ where
         let Some(span) = ctx.span(&id) else {
             return;
         };
+
         let Some(mut trace) = span.extensions_mut().remove::<idl::Trace>() else {
             return;
         };
@@ -237,11 +291,12 @@ where
         }
 
         let mut packet = idl::TracePacket::default();
+        let meta = span.metadata();
         let event = THREAD_TRACK_UUID.with(|id| {
             create_event(
                 id.load(Ordering::Relaxed),
-                Some(span.metadata().name()),
-                span.metadata().file().zip(span.metadata().line()),
+                Some(meta.name()),
+                meta.file().zip(meta.line()),
                 debug_annotations,
                 Some(idl::track_event::Type::SliceEnd),
             )
