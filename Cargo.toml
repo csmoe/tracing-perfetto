@@ -2,6 +2,18 @@
 name = "tracing-perfetto"
 version = "0.1.0"
 edition = "2021"
+authors = [ "csmoe@msn.com" ]
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/csmoe/tracing-perfetto"
+categories = [
+    "development-tools::debugging",
+    "development-tools::profiling",
+]
+keywors = [ "perfetto", "tracing", "subscriber", "profiling" ]
+description = """
+Tracing layer for recording spans and events as perfetto event format.
+"""
 
 [dependencies]
 anyhow = "1.0.86"
