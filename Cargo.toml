@@ -10,7 +10,7 @@ categories = [
     "development-tools::debugging",
     "development-tools::profiling",
 ]
-keywors = [ "perfetto", "tracing", "subscriber", "profiling" ]
+keywords = [ "perfetto", "tracing", "subscriber", "profiling" ]
 description = """
 Tracing layer for recording spans and events as perfetto event format.
 """
