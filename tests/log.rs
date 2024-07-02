@@ -8,7 +8,7 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, Registry};
 async fn write() -> anyhow::Result<()> {
     let file = std::env::temp_dir().join("test.pftrace");
     let perfetto_layer = PerfettoLayer::new(std::sync::Mutex::new(std::fs::File::create(&file)?))
-        .with_filter_by_marker(|s| s == "perfetto");
+        .with_debug_annotations(true);
 
     let fmt_layer = fmt::layer()
         .with_writer(std::io::stdout)
@@ -25,7 +25,7 @@ async fn write() -> anyhow::Result<()> {
     let _enter = demo_span.enter();
 
     info!("in span");
-    sync_fn();
+    sync_fn(1);
     let handle = Handle::current();
     let t = std::thread::spawn(move || {
         handle.spawn(async_fn());
@@ -37,14 +37,13 @@ async fn write() -> anyhow::Result<()> {
 }
 
 #[tracing::instrument(fields(perfetto = true))]
-fn sync_fn() {
+fn sync_fn(i: i32) {
     info!("inside function");
-    sync_inner();
+    sync_inner(i + 1);
 }
 
-#[tracing::instrument]
-fn sync_inner() {
-    let x = 1;
+#[tracing::instrument(skip_all, level = "trace", fields(perfetto = true))]
+fn sync_inner(x: i32) {
     info!(x, "inner");
 }
 

@@ -231,13 +231,18 @@ where
             return;
         }
 
+        let mut debug_annotations = DebugAnnotations::default();
+        if self.config.debug_annotations {
+            attrs.record(&mut debug_annotations);
+        }
+
         let mut packet = idl::TracePacket::default();
         let thread_track_uuid = THREAD_TRACK_UUID.with(|id| id.load(Ordering::Relaxed));
         let event = create_event(
             thread_track_uuid,
             Some(span.name()),
             span.metadata().file().zip(span.metadata().line()),
-            DebugAnnotations::default(),
+            debug_annotations,
             Some(idl::track_event::Type::SliceBegin),
         );
         packet.data = Some(idl::trace_packet::Data::TrackEvent(event));
@@ -317,20 +322,7 @@ where
             return;
         };
 
-        let mut debug_annotations = DebugAnnotations::default();
-        if self.config.debug_annotations {
-            debug_annotations.annotations.push({
-                let mut annotation = idl::DebugAnnotation::default();
-                annotation.name_field = Some(idl::debug_annotation::NameField::Name(
-                    "metadata".to_string(),
-                ));
-                annotation.value = Some(idl::debug_annotation::Value::StringValue(format!(
-                    "{:?}",
-                    span.metadata()
-                )));
-                annotation
-            });
-        }
+        let debug_annotations = DebugAnnotations::default();
 
         let mut packet = idl::TracePacket::default();
         let meta = span.metadata();
