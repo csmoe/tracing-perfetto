@@ -258,6 +258,28 @@ where
         });
     }
 
+    fn on_record(&self, span: &span::Id, values: &span::Record<'_>, ctx: Context<'_, S>) {
+        let Some(span) = ctx.span(span) else {
+            return;
+        };
+        if let Some(f) = self.config.filter {
+            if !PerfettoVisitor::new(f).perfetto {
+                return;
+            }
+        }
+        if let Some(extension) = span.extensions_mut().get_mut::<idl::Trace>() {
+            if let Some(idl::trace_packet::Data::TrackEvent(ref mut event)) =
+                &mut extension.packet[0].data
+            {
+                let mut debug_annotations = DebugAnnotations::default();
+                values.record(&mut debug_annotations);
+                event
+                    .debug_annotations
+                    .append(&mut debug_annotations.annotations);
+            }
+        };
+    }
+
     fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
         let enabled = self
             .config
