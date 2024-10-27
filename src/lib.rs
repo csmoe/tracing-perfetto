@@ -267,7 +267,7 @@ where
                 event.record(&mut visitor);
                 visitor.perfetto
             })
-            .unwrap_or_default();
+            .unwrap_or(true);
 
         if !enabled {
             return;
