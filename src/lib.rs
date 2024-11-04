@@ -16,13 +16,14 @@ use tracing_subscriber::layer::Context;
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::Layer;
 
+#[allow(clippy::all)]
 mod idl {
     include!(concat!(env!("OUT_DIR"), "/perfetto.protos.rs"));
 }
 
 thread_local! {
     static THREAD_TRACK_UUID: AtomicU64 = AtomicU64::new(rand::random::<u64>());
-    static THREAD_DESCRIPTOR_SENT: AtomicBool = AtomicBool::new(false);
+    static THREAD_DESCRIPTOR_SENT: AtomicBool = const { AtomicBool::new(false) };
 }
 
 // This is thread safe, since duplicated descriptor will be combined into one by perfetto.
@@ -416,69 +417,39 @@ struct DebugAnnotations {
     annotations: Vec<idl::DebugAnnotation>,
 }
 
+macro_rules! impl_record {
+    ($method:ident, $type:ty, $value_variant:ident) => {
+        fn $method(&mut self, field: &Field, value: $type) {
+            let mut annotation = idl::DebugAnnotation::default();
+            annotation.name_field = Some(idl::debug_annotation::NameField::Name(
+                field.name().to_string(),
+            ));
+            annotation.value = Some(idl::debug_annotation::Value::$value_variant(value.into()));
+            self.annotations.push(annotation);
+        }
+    };
+    ($method:ident, $type:ty, $value_variant:ident, $conversion:expr) => {
+        fn $method(&mut self, field: &Field, value: $type) {
+            let mut annotation = idl::DebugAnnotation::default();
+            annotation.name_field = Some(idl::debug_annotation::NameField::Name(
+                field.name().to_string(),
+            ));
+            annotation.value = Some(idl::debug_annotation::Value::$value_variant($conversion(
+                value,
+            )));
+            self.annotations.push(annotation);
+        }
+    };
+}
+
 impl Visit for DebugAnnotations {
-    fn record_bool(&mut self, field: &Field, value: bool) {
-        let mut annotation = idl::DebugAnnotation::default();
-        annotation.name_field = Some(idl::debug_annotation::NameField::Name(
-            field.name().to_string(),
-        ));
-        annotation.value = Some(idl::debug_annotation::Value::BoolValue(value));
-        self.annotations.push(annotation);
-    }
-
-    fn record_str(&mut self, field: &Field, value: &str) {
-        let mut annotation = idl::DebugAnnotation::default();
-        annotation.name_field = Some(idl::debug_annotation::NameField::Name(
-            field.name().to_string(),
-        ));
-        annotation.value = Some(idl::debug_annotation::Value::StringValue(value.to_string()));
-        self.annotations.push(annotation);
-    }
-
-    fn record_f64(&mut self, field: &Field, value: f64) {
-        let mut annotation = idl::DebugAnnotation::default();
-        annotation.name_field = Some(idl::debug_annotation::NameField::Name(
-            field.name().to_string(),
-        ));
-        annotation.value = Some(idl::debug_annotation::Value::DoubleValue(value));
-        self.annotations.push(annotation);
-    }
-
-    fn record_i64(&mut self, field: &Field, value: i64) {
-        let mut annotation = idl::DebugAnnotation::default();
-        annotation.name_field = Some(idl::debug_annotation::NameField::Name(
-            field.name().to_string(),
-        ));
-        annotation.value = Some(idl::debug_annotation::Value::IntValue(value));
-        self.annotations.push(annotation);
-    }
-
-    fn record_i128(&mut self, field: &Field, value: i128) {
-        let mut annotation = idl::DebugAnnotation::default();
-        annotation.name_field = Some(idl::debug_annotation::NameField::Name(
-            field.name().to_string(),
-        ));
-        annotation.value = Some(idl::debug_annotation::Value::StringValue(value.to_string()));
-        self.annotations.push(annotation);
-    }
-
-    fn record_u128(&mut self, field: &Field, value: u128) {
-        let mut annotation = idl::DebugAnnotation::default();
-        annotation.name_field = Some(idl::debug_annotation::NameField::Name(
-            field.name().to_string(),
-        ));
-        annotation.value = Some(idl::debug_annotation::Value::StringValue(value.to_string()));
-        self.annotations.push(annotation);
-    }
-
-    fn record_u64(&mut self, field: &Field, value: u64) {
-        let mut annotation = idl::DebugAnnotation::default();
-        annotation.name_field = Some(idl::debug_annotation::NameField::Name(
-            field.name().to_string(),
-        ));
-        annotation.value = Some(idl::debug_annotation::Value::IntValue(value as _));
-        self.annotations.push(annotation);
-    }
+    impl_record!(record_bool, bool, BoolValue);
+    impl_record!(record_str, &str, StringValue, String::from);
+    impl_record!(record_f64, f64, DoubleValue);
+    impl_record!(record_i64, i64, IntValue);
+    impl_record!(record_i128, i128, StringValue, |v: i128| v.to_string());
+    impl_record!(record_u128, u128, StringValue, |v: u128| v.to_string());
+    impl_record!(record_u64, u64, IntValue, |v: u64| v as i64);
 
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
         let mut annotation = idl::DebugAnnotation::default();
