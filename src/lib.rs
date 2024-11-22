@@ -17,6 +17,8 @@ use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::Layer;
 
 #[path = "perfetto.protos.rs"]
+#[allow(clippy::all)]
+#[rustfmt::skip]
 mod idl;
 
 thread_local! {
@@ -102,56 +104,55 @@ impl<W: PerfettoWriter> PerfettoLayer<W> {
         self
     }
 
-    fn append_thread_descriptor(&self, trace: &mut idl::Trace) {
+    fn thread_descriptor(&self) -> Option<idl::TracePacket> {
         let thread_first_frame_sent =
             THREAD_DESCRIPTOR_SENT.with(|v| v.fetch_or(true, Ordering::SeqCst));
+        if thread_first_frame_sent {
+            return None;
+        }
         let thread_track_uuid = THREAD_TRACK_UUID.with(|id| id.load(Ordering::Relaxed));
-        if !thread_first_frame_sent {
-            let mut packet = idl::TracePacket::default();
-            packet.optional_trusted_uid = Some(idl::trace_packet::OptionalTrustedUid::TrustedUid(
-                self.sequence_id.get() as _,
-            ));
-            let thread = create_thread_descriptor().into();
-            let track_desc = create_track_descriptor(
-                thread_track_uuid.into(),
-                self.track_uuid.get().into(),
-                std::thread::current().name(),
-                None,
-                thread,
-                None,
-            );
-            packet.data = Some(idl::trace_packet::Data::TrackDescriptor(track_desc));
-            trace.packet.push(packet);
-        }
+        let mut packet = idl::TracePacket::default();
+        let thread = create_thread_descriptor().into();
+        let track_desc = create_track_descriptor(
+            thread_track_uuid.into(),
+            None,
+            std::thread::current().name(),
+            None,
+            thread,
+            None,
+        );
+        packet.data = Some(idl::trace_packet::Data::TrackDescriptor(track_desc));
+        Some(packet)
     }
 
-    fn append_process_descriptor(&self, trace: &mut idl::Trace) {
+    fn process_descriptor(&self) -> Option<idl::TracePacket> {
         let process_first_frame_sent = PROCESS_DESCRIPTOR_SENT.fetch_or(true, Ordering::SeqCst);
-        if !process_first_frame_sent {
-            let mut packet = idl::TracePacket::default();
-            packet.optional_trusted_uid = Some(idl::trace_packet::OptionalTrustedUid::TrustedUid(
-                self.sequence_id.get() as _,
-            ));
-            let process = create_process_descriptor().into();
-            let track_desc = create_track_descriptor(
-                self.track_uuid.get().into(),
-                None,
-                None::<&str>,
-                process,
-                None,
-                None,
-            );
-            packet.data = Some(idl::trace_packet::Data::TrackDescriptor(track_desc));
-            trace.packet.push(packet);
+        if process_first_frame_sent {
+            return None;
         }
+        let mut packet = idl::TracePacket::default();
+        let process = create_process_descriptor().into();
+        let track_desc = create_track_descriptor(
+            self.track_uuid.get().into(),
+            None,
+            None::<&str>,
+            process,
+            None,
+            None,
+        );
+        packet.data = Some(idl::trace_packet::Data::TrackDescriptor(track_desc));
+        Some(packet)
     }
 
-    fn write_log(&self, log: idl::Trace) {
+    fn write_log(&self, mut log: idl::Trace) {
         let mut buf = BytesMut::new();
-        let mut log = log;
 
-        self.append_process_descriptor(&mut log);
-        self.append_thread_descriptor(&mut log);
+        if let Some(p) = self.process_descriptor() {
+            log.packet.insert(0, p);
+        }
+        if let Some(t) = self.thread_descriptor() {
+            log.packet.insert(1, t);
+        }
 
         let Ok(_) = log.encode(&mut buf) else {
             return;
@@ -391,6 +392,7 @@ fn create_event(
 ) -> idl::TrackEvent {
     let mut event = idl::TrackEvent::default();
     event.track_uuid = Some(track_uuid);
+    event.categories = vec!["".to_string()];
     if let Some(name) = name {
         event.name_field = Some(idl::track_event::NameField::Name(name.to_string()));
     }
