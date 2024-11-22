@@ -16,10 +16,8 @@ use tracing_subscriber::layer::Context;
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::Layer;
 
-#[allow(clippy::all)]
-mod idl {
-    include!(concat!(env!("OUT_DIR"), "/perfetto.protos.rs"));
-}
+#[path = "perfetto.protos.rs"]
+mod idl;
 
 thread_local! {
     static THREAD_TRACK_UUID: AtomicU64 = AtomicU64::new(rand::random::<u64>());
