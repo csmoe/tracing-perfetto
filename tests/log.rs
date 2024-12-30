@@ -1,5 +1,5 @@
 use tokio::runtime::Handle;
-use tracing::{info, span, Level};
+use tracing::{field, info, span, Level};
 use tracing_perfetto::PerfettoLayer;
 use tracing_subscriber::fmt::format::Format;
 use tracing_subscriber::{fmt, layer::SubscriberExt, Registry};
@@ -21,7 +21,12 @@ async fn write() -> anyhow::Result<()> {
 
     info!(?file, "start");
 
-    let demo_span = span!(Level::TRACE, "demo_span");
+    let demo_span = span!(
+        Level::TRACE,
+        "demo_span",
+        regular_arg = "Arg data",
+        extra_arg = field::Empty
+    );
     let _enter = demo_span.enter();
 
     info!("in span");
@@ -33,6 +38,8 @@ async fn write() -> anyhow::Result<()> {
     t.join().unwrap();
 
     _ = tokio::spawn(async_fn()).await;
+    demo_span.record("extra_arg", "Some Extra Data");
+    demo_span.record("regular_arg", "New Arg Data");
     Ok(())
 }
 
