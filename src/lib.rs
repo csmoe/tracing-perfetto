@@ -2,9 +2,12 @@
 #![forbid(unsafe_code)]
 
 use bytes::BytesMut;
+use idl_helpers::process_descriptor;
+use idl_helpers::{
+    create_event, create_track_descriptor, current_thread_uuid, unique_uuid, DebugAnnotations,
+};
 use prost::Message;
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tracing::field::Field;
 use tracing::field::Visit;
 use tracing::span;
@@ -16,18 +19,18 @@ use tracing_subscriber::layer::Context;
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::Layer;
 
+
 #[path = "perfetto.protos.rs"]
 #[allow(clippy::all)]
 #[rustfmt::skip]
 mod idl;
 
-thread_local! {
-    static THREAD_TRACK_UUID: AtomicU64 = AtomicU64::new(rand::random::<u64>());
-    static THREAD_DESCRIPTOR_SENT: AtomicBool = const { AtomicBool::new(false) };
-}
+mod idl_helpers;
 
-// This is thread safe, since duplicated descriptor will be combined into one by perfetto.
-static PROCESS_DESCRIPTOR_SENT: AtomicBool = AtomicBool::new(false);
+struct PerfettoSpanState {
+    track_descriptor: Option<idl::TrackDescriptor>, // optional track descriptor for this span, defaults to thread if not found
+    trace: idl::Trace, // The Protobuf trace messages that we accumulate for this span.
+}
 
 /// A `Layer` that records span as perfetto's
 /// `TYPE_SLICE_BEGIN`/`TYPE_SLICE_END`, and event as `TYPE_INSTANT`.
@@ -35,7 +38,7 @@ static PROCESS_DESCRIPTOR_SENT: AtomicBool = AtomicBool::new(false);
 /// `PerfettoLayer` will output the records as encoded [protobuf messages](https://github.com/google/perfetto).
 pub struct PerfettoLayer<W = fn() -> std::io::Stdout> {
     sequence_id: SequenceId,
-    track_uuid: TrackUuid,
+    process_track_uuid: TrackUuid,
     writer: W,
     config: Config,
 }
@@ -63,7 +66,7 @@ impl<W: PerfettoWriter> PerfettoLayer<W> {
     pub fn new(writer: W) -> Self {
         Self {
             sequence_id: SequenceId::new(rand::random()),
-            track_uuid: TrackUuid::new(rand::random()),
+            process_track_uuid: TrackUuid::new(rand::random()),
             writer,
             config: Config::default(),
         }
@@ -104,55 +107,24 @@ impl<W: PerfettoWriter> PerfettoLayer<W> {
         self
     }
 
-    fn thread_descriptor(&self) -> Option<idl::TracePacket> {
-        let thread_first_frame_sent =
-            THREAD_DESCRIPTOR_SENT.with(|v| v.fetch_or(true, Ordering::SeqCst));
-        if thread_first_frame_sent {
-            return None;
-        }
-        let thread_track_uuid = THREAD_TRACK_UUID.with(|id| id.load(Ordering::Relaxed));
-        let mut packet = idl::TracePacket::default();
-        let thread = create_thread_descriptor().into();
-        let track_desc = create_track_descriptor(
-            thread_track_uuid.into(),
-            None,
-            std::thread::current().name(),
-            None,
-            thread,
-            None,
-        );
-        packet.data = Some(idl::trace_packet::Data::TrackDescriptor(track_desc));
-        Some(packet)
-    }
-
-    fn process_descriptor(&self) -> Option<idl::TracePacket> {
-        let process_first_frame_sent = PROCESS_DESCRIPTOR_SENT.fetch_or(true, Ordering::SeqCst);
-        if process_first_frame_sent {
-            return None;
-        }
-        let mut packet = idl::TracePacket::default();
-        let process = create_process_descriptor().into();
-        let track_desc = create_track_descriptor(
-            self.track_uuid.get().into(),
-            None,
-            None::<&str>,
-            process,
-            None,
-            None,
-        );
-        packet.data = Some(idl::trace_packet::Data::TrackDescriptor(track_desc));
-        Some(packet)
-    }
-
-    fn write_log(&self, mut log: idl::Trace) {
+    fn write_log(&self, mut log: idl::Trace, track_descriptor: idl::TrackDescriptor) {
         let mut buf = BytesMut::new();
 
-        if let Some(p) = self.process_descriptor() {
+        if let Some(p) = process_descriptor(self.process_track_uuid.get()) {
             log.packet.insert(0, p);
         }
-        if let Some(t) = self.thread_descriptor() {
-            log.packet.insert(1, t);
-        }
+
+        let mut packet = idl::TracePacket::default();
+        packet.data = Some(idl::trace_packet::Data::TrackDescriptor(track_descriptor));
+        log.packet.insert(1, packet);
+
+        // if let Some(t) = track_descriptor {
+        //     let mut packet = idl::TracePacket::default();
+        //     packet.data = Some(idl::trace_packet::Data::TrackDescriptor(t));
+        //     log.packet.insert(1, packet);
+        // } else if let Some(t) = self.thread_descriptor() {
+        //     log.packet.insert(1, t);
+        // }
 
         let Ok(_) = log.encode(&mut buf) else {
             return;
@@ -185,6 +157,29 @@ impl TrackUuid {
     }
 }
 
+struct TrackNameVisitor<'a> {
+    user_track_name: &'a mut Option<String>,
+}
+
+impl<'a> Visit for TrackNameVisitor<'a> {
+    // fn record_u64(&mut self, field: &Field, value: u64) {
+    //     if field.name() == "perfetto_track_id" {
+    //         *self.user_track_id = Some(value);
+    //     }
+    // }
+
+    fn record_str(&mut self, field: &Field, value: &str) {
+        if field.name() == "perfetto.track_name" {
+            *self.user_track_name = Some(value.to_string());
+        }
+    }
+    fn record_debug(&mut self, _field: &Field, _value: &dyn std::fmt::Debug) {
+        // If you want to parse `perfetto_track_id` from a non-u64 typed field,
+        // you could do that here, e.g. if user sets `perfetto_track_id = "0xABCD"`.
+        // For now, we'll ignore it.
+    }
+    // Optionally implement record_* for other numeric types if needed
+}
 struct PerfettoVisitor {
     perfetto: bool,
     filter: fn(&str) -> bool,
@@ -237,9 +232,50 @@ where
         }
 
         let mut packet = idl::TracePacket::default();
-        let thread_track_uuid = THREAD_TRACK_UUID.with(|id| id.load(Ordering::Relaxed));
+
+        // check if parent span has a non default track descriptor
+        let inherited_track_descriptor = span
+            .parent()
+            // If the span has a parent, try retrieving the track descriptor from the parent's state
+            .and_then(|parent_span| {
+                parent_span
+                    .extensions()
+                    .get::<PerfettoSpanState>()
+                    .map(|state| state.track_descriptor.clone())
+            })
+            .flatten();
+
+        // retrieve the user set track name (via `perfetto.track_name` field)
+        let mut user_track_name = None;
+        let mut visitor = TrackNameVisitor {
+            user_track_name: &mut user_track_name,
+        };
+        attrs.record(&mut visitor);
+
+        // resolve the optional track descriptor for this span (either inherited from parent or user set, or None)
+        let span_track_descriptor = user_track_name
+            .map(|name| {
+                let track_desc = create_track_descriptor(
+                    Some(unique_uuid()),                 // uuid
+                    Some(self.process_track_uuid.get()), // parent_uuid
+                    Some(name),                          // name
+                    None,                                // process
+                    // Some(current_process_descriptor()), // process
+                    // current_thread_descriptor().into(), // thread descriptor
+                    None, // thread descriptor
+                    None,
+                );
+                track_desc
+            })
+            .or(inherited_track_descriptor);
+
+        let final_uuid = span_track_descriptor
+            .as_ref()
+            .map(|desc| desc.uuid())
+            .unwrap_or_else(|| current_thread_uuid());
+
         let event = create_event(
-            thread_track_uuid,
+            final_uuid, // span track id if exists, otherwise thread track id
             Some(span.name()),
             span.metadata().file().zip(span.metadata().line()),
             debug_annotations,
@@ -253,9 +289,14 @@ where
                 self.sequence_id.get() as _,
             ),
         );
-        span.extensions_mut().insert(idl::Trace {
-            packet: vec![packet],
-        });
+
+        let span_state = PerfettoSpanState {
+            track_descriptor: span_track_descriptor,
+            trace: idl::Trace {
+                packet: vec![packet],
+            },
+        };
+        span.extensions_mut().insert(span_state);
     }
 
     fn on_record(&self, span: &span::Id, values: &span::Record<'_>, ctx: Context<'_, S>) {
@@ -266,9 +307,9 @@ where
         // We don't check the filter here -- we've already checked it when we handled the span on
         // `on_new_span`. Iff we successfully attached a track packet to the span, then we'll also
         // update the trace packet with the debug data here.
-        if let Some(extension) = span.extensions_mut().get_mut::<idl::Trace>() {
+        if let Some(extension) = span.extensions_mut().get_mut::<PerfettoSpanState>() {
             if let Some(idl::trace_packet::Data::TrackEvent(ref mut event)) =
-                &mut extension.packet[0].data
+                &mut extension.trace.packet[0].data
             {
                 let mut debug_annotations = DebugAnnotations::default();
                 values.record(&mut debug_annotations);
@@ -303,17 +344,17 @@ where
             event.record(&mut debug_annotations);
         }
 
-        let track_event = THREAD_TRACK_UUID.with(|id| {
-            create_event(
-                id.load(Ordering::Relaxed),
-                Some(metadata.name()),
-                location,
-                debug_annotations,
-                Some(idl::track_event::Type::Instant),
-            )
-        });
+        let thread_track_uuid = current_thread_uuid();
+        let mut track_event = create_event(
+            0,
+            Some(metadata.name()),
+            location,
+            debug_annotations,
+            Some(idl::track_event::Type::Instant),
+        );
+
         let mut packet = idl::TracePacket::default();
-        packet.data = Some(idl::trace_packet::Data::TrackEvent(track_event));
+        // packet.data = Some(idl::trace_packet::Data::TrackEvent(track_event));
         packet.trusted_pid = Some(std::process::id() as _);
         packet.timestamp = chrono::Local::now().timestamp_nanos_opt().map(|t| t as _);
         packet.optional_trusted_packet_sequence_id = Some(
@@ -323,15 +364,25 @@ where
         );
 
         if let Some(span) = ctx.event_span(event) {
-            if let Some(trace) = span.extensions_mut().get_mut::<idl::Trace>() {
-                trace.packet.push(packet);
+            if let Some(span_state) = span.extensions_mut().get_mut::<PerfettoSpanState>() {
+                track_event.track_uuid = span_state
+                    .track_descriptor
+                    .as_ref()
+                    .map(|d| d.uuid())
+                    .or(Some(current_thread_uuid()));
+                packet.data = Some(idl::trace_packet::Data::TrackEvent(track_event));
+                span_state.trace.packet.push(packet);
                 return;
             }
         }
+
+        // no span or no span state, just write the event
+        track_event.track_uuid = Some(thread_track_uuid);
+        packet.data = Some(idl::trace_packet::Data::TrackEvent(track_event));
         let trace = idl::Trace {
             packet: vec![packet],
         };
-        self.write_log(trace);
+        self.write_log(trace, idl_helpers::current_thread_track_descriptor());
     }
 
     fn on_close(&self, id: Id, ctx: Context<'_, S>) {
@@ -339,23 +390,27 @@ where
             return;
         };
 
-        let Some(mut trace) = span.extensions_mut().remove::<idl::Trace>() else {
+        let Some(mut span_state) = span.extensions_mut().remove::<PerfettoSpanState>() else {
             return;
         };
 
         let debug_annotations = DebugAnnotations::default();
 
+        let track_uuid = span_state
+            .track_descriptor
+            .as_ref()
+            .map(|d| d.uuid())
+            .unwrap_or_else(|| current_thread_uuid());
+
         let mut packet = idl::TracePacket::default();
         let meta = span.metadata();
-        let event = THREAD_TRACK_UUID.with(|id| {
-            create_event(
-                id.load(Ordering::Relaxed),
-                Some(meta.name()),
-                meta.file().zip(meta.line()),
-                debug_annotations,
-                Some(idl::track_event::Type::SliceEnd),
-            )
-        });
+        let event = create_event(
+            track_uuid,
+            Some(meta.name()),
+            meta.file().zip(meta.line()),
+            debug_annotations,
+            Some(idl::track_event::Type::SliceEnd),
+        );
         packet.data = Some(idl::trace_packet::Data::TrackEvent(event));
         packet.timestamp = chrono::Local::now().timestamp_nanos_opt().map(|t| t as _);
         packet.trusted_pid = Some(std::process::id() as _);
@@ -364,78 +419,16 @@ where
                 self.sequence_id.get() as _,
             ),
         );
-        trace.packet.push(packet);
 
-        self.write_log(trace);
+        span_state.trace.packet.push(packet);
+
+        self.write_log(
+            span_state.trace,
+            span_state
+                .track_descriptor
+                .unwrap_or_else(idl_helpers::current_thread_track_descriptor),
+        );
     }
-}
-
-fn create_thread_descriptor() -> idl::ThreadDescriptor {
-    let mut thread = idl::ThreadDescriptor::default();
-    thread.pid = Some(std::process::id() as _);
-    thread.tid = Some(thread_id::get() as _);
-    thread.thread_name = std::thread::current().name().map(|n| n.to_string());
-    thread
-}
-
-fn create_process_descriptor() -> idl::ProcessDescriptor {
-    let mut process = idl::ProcessDescriptor::default();
-    process.pid = Some(std::process::id() as _);
-    process
-}
-
-fn create_track_descriptor(
-    uuid: Option<u64>,
-    parent_uuid: Option<u64>,
-    name: Option<impl AsRef<str>>,
-    process: Option<idl::ProcessDescriptor>,
-    thread: Option<idl::ThreadDescriptor>,
-    counter: Option<idl::CounterDescriptor>,
-) -> idl::TrackDescriptor {
-    let mut desc = idl::TrackDescriptor::default();
-    desc.uuid = uuid;
-    desc.parent_uuid = parent_uuid;
-    desc.static_or_dynamic_name = name
-        .map(|s| s.as_ref().to_string())
-        .map(idl::track_descriptor::StaticOrDynamicName::Name);
-    desc.process = process;
-    desc.thread = thread;
-    desc.counter = counter;
-    desc
-}
-
-fn create_event(
-    track_uuid: u64,
-    name: Option<&str>,
-    location: Option<(&str, u32)>,
-    debug_annotations: DebugAnnotations,
-    r#type: Option<idl::track_event::Type>,
-) -> idl::TrackEvent {
-    let mut event = idl::TrackEvent::default();
-    event.track_uuid = Some(track_uuid);
-    event.categories = vec!["".to_string()];
-    if let Some(name) = name {
-        event.name_field = Some(idl::track_event::NameField::Name(name.to_string()));
-    }
-    if let Some(t) = r#type {
-        event.set_type(t);
-    }
-    if !debug_annotations.annotations.is_empty() {
-        event.debug_annotations = debug_annotations.annotations;
-    }
-    if let Some((file, line)) = location {
-        let mut source_location = idl::SourceLocation::default();
-        source_location.file_name = Some(file.to_owned());
-        source_location.line_number = Some(line);
-        let location = idl::track_event::SourceLocationField::SourceLocation(source_location);
-        event.source_location_field = Some(location);
-    }
-    event
-}
-
-#[derive(Default)]
-struct DebugAnnotations {
-    annotations: Vec<idl::DebugAnnotation>,
 }
 
 macro_rules! impl_record {
