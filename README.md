@@ -32,4 +32,4 @@ Open that file with [ui.perfetto.dev](https://ui.perfetto.dev):
 
 # License
 
-Licensed under the [MIT license](http://opensource.org/licenses/MIT)
+Licensed under the [MIT license](https://opensource.org/license/mit).
