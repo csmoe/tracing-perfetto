@@ -46,6 +46,27 @@ pub fn current_thread_track_descriptor() -> idl::TrackDescriptor {
     track_desc
 }
 
+impl idl::TrackDescriptor {
+    pub fn named_child_for(name: &str, parent_uuid: u64) -> Self {
+        idl::TrackDescriptor {
+            uuid: Some(unique_uuid()),
+            parent_uuid: Some(parent_uuid),
+            static_or_dynamic_name: Some(idl::track_descriptor::StaticOrDynamicName::Name(
+                name.to_string(),
+            )),
+            ..Default::default()
+        }
+    }
+
+    pub fn for_process_descriptor(uuid: u64, process_descriptor: idl::ProcessDescriptor) -> Self {
+        idl::TrackDescriptor {
+            uuid: Some(uuid),
+            process: Some(process_descriptor),
+            ..Default::default()
+        }
+    }
+}
+
 pub fn create_track_descriptor(
     uuid: Option<u64>,
     parent_uuid: Option<u64>,
@@ -54,16 +75,21 @@ pub fn create_track_descriptor(
     thread: Option<idl::ThreadDescriptor>,
     counter: Option<idl::CounterDescriptor>,
 ) -> idl::TrackDescriptor {
-    let mut desc = idl::TrackDescriptor::default();
-    desc.uuid = uuid;
-    desc.parent_uuid = parent_uuid;
-    desc.static_or_dynamic_name = name
-        .map(|s| s.as_ref().to_string())
-        .map(idl::track_descriptor::StaticOrDynamicName::Name);
-    desc.process = process;
-    desc.thread = thread;
-    desc.counter = counter;
-    desc
+    idl::TrackDescriptor {
+        uuid,
+        parent_uuid,
+        static_or_dynamic_name: name
+            .map(|s| s.as_ref().to_string())
+            .map(idl::track_descriptor::StaticOrDynamicName::Name),
+        process,
+        thread,
+        counter,
+        chrome_process: None,
+        chrome_thread: None,
+        child_ordering: None,
+        sibling_order_rank: None,
+        disallow_merging_with_system_tracks: None,
+    }
 }
 
 pub fn current_process_descriptor() -> idl::ProcessDescriptor {
@@ -77,17 +103,16 @@ pub fn process_descriptor(process_track_uuid: u64) -> Option<idl::TracePacket> {
     if process_first_frame_sent {
         return None;
     }
-    let mut packet = idl::TracePacket::default();
-    let process = current_process_descriptor().into();
-    let track_desc = create_track_descriptor(
-        Some(process_track_uuid),
-        None,
-        None::<&str>,
-        process,
-        None,
-        None,
+
+    let track_desc = idl::TrackDescriptor::for_process_descriptor(
+        process_track_uuid,
+        current_process_descriptor(),
     );
-    packet.data = Some(idl::trace_packet::Data::TrackDescriptor(track_desc));
+
+    let packet = idl::TracePacket {
+        data: Some(idl::trace_packet::Data::TrackDescriptor(track_desc)),
+        ..Default::default()
+    };
     Some(packet)
 }
 
@@ -96,24 +121,27 @@ pub fn create_event(
     name: Option<&str>,
     location: Option<(&str, u32)>,
     debug_annotations: DebugAnnotations,
-    r#type: Option<idl::track_event::Type>,
+    track_event_type: Option<idl::track_event::Type>,
 ) -> idl::TrackEvent {
-    let mut event = idl::TrackEvent::default();
-    event.track_uuid = Some(track_uuid);
-    event.categories = vec!["".to_string()];
-    if let Some(name) = name {
-        event.name_field = Some(idl::track_event::NameField::Name(name.to_string()));
-    }
-    if let Some(t) = r#type {
+    let mut event = idl::TrackEvent {
+        track_uuid: Some(track_uuid),
+        categories: vec!["".to_string()],
+        name_field: name.map(|name| idl::track_event::NameField::Name(name.to_string())),
+        ..Default::default()
+    };
+    if let Some(t) = track_event_type {
         event.set_type(t);
     }
+
     if !debug_annotations.annotations.is_empty() {
         event.debug_annotations = debug_annotations.annotations;
     }
     if let Some((file, line)) = location {
-        let mut source_location = idl::SourceLocation::default();
-        source_location.file_name = Some(file.to_owned());
-        source_location.line_number = Some(line);
+        let source_location = idl::SourceLocation {
+            file_name: Some(file.to_owned()),
+            line_number: Some(line),
+            ..Default::default()
+        };
         let location = idl::track_event::SourceLocationField::SourceLocation(source_location);
         event.source_location_field = Some(location);
     }
