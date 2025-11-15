@@ -207,7 +207,7 @@ impl Visit for PerfettoVisitor {
 impl<W, S: Subscriber> Layer<S> for PerfettoLayer<W>
 where
     S: for<'a> LookupSpan<'a>,
-    W: for<'writer> MakeWriter<'writer> + 'static,
+    W: PerfettoWriter + 'static,
 {
     fn on_new_span(&self, attrs: &span::Attributes<'_>, id: &span::Id, ctx: Context<'_, S>) {
         let Some(span) = ctx.span(id) else {
